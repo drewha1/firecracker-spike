@@ -1,0 +1,60 @@
+name: kvm-firecracker-probe
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe environment and Firecracker boot
+        run: |
+          set +e
+          {
+          echo "# Firecracker venue probe"
+          echo "Date (UTC): $(date -u +%FT%TZ)"
+          echo "Runner OS: $RUNNER_OS"
+          echo "Kernel: $(uname -r) / Arch: $(uname -m)"
+          echo
+          echo "## KVM"
+          if [ -e /dev/kvm ]; then echo "/dev/kvm: PRESENT"; else echo "/dev/kvm: ABSENT"; fi
+          echo "vmx/svm flag count: $(grep -Eoc '(vmx|svm)' /proc/cpuinfo)"
+          sudo chmod 666 /dev/kvm 2>/dev/null
+          echo
+          echo "## Firecracker"
+          ARCH=$(uname -m)
+          REL=$(curl -fsSL https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
+          echo "Latest release: $REL"
+          curl -fsSL -o fc.tgz "https://github.com/firecracker-microvm/firecracker/releases/download/${REL}/firecracker-${REL}-${ARCH}.tgz" && tar -xzf fc.tgz
+          FC=$(find . -name "firecracker-${REL}-${ARCH}" -type f | head -1)
+          $FC --version
+          echo
+          echo "## Boot test"
+          curl -fsSL -o vmlinux.bin "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${ARCH}/kernels/vmlinux.bin" && echo "kernel: downloaded" || echo "kernel: DOWNLOAD FAILED"
+          curl -fsSL -o rootfs.ext4 "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${ARCH}/rootfs/bionic.rootfs.ext4" && echo "rootfs: downloaded" || echo "rootfs: DOWNLOAD FAILED"
+          rm -f /tmp/fc.sock
+          $FC --api-sock /tmp/fc.sock > fc.log 2>&1 &
+          sleep 2
+          curl -s -X PUT --unix-socket /tmp/fc.sock -H 'Accept: application/json' -H 'Content-Type: application/json' -d "{\"kernel_image_path\":\"$PWD/vmlinux.bin\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off\"}" http://localhost/boot-source; echo " <- boot-source"
+          curl -s -X PUT --unix-socket /tmp/fc.sock -H 'Accept: application/json' -H 'Content-Type: application/json' -d "{\"drive_id\":\"rootfs\",\"path_on_host\":\"$PWD/rootfs.ext4\",\"is_root_device\":true,\"is_read_only\":false}" http://localhost/drives/rootfs; echo " <- drive"
+          curl -s -X PUT --unix-socket /tmp/fc.sock -H 'Accept: application/json' -H 'Content-Type: application/json' -d '{"vcpu_count":1,"mem_size_mib":128}' http://localhost/machine-config; echo " <- machine-config"
+          curl -s -X PUT --unix-socket /tmp/fc.sock -H 'Accept: application/json' -H 'Content-Type: application/json' -d '{"action_type":"InstanceStart"}' http://localhost/actions; echo " <- start"
+          sleep 3
+          if pgrep -f "firecracker.*api-sock" > /dev/null; then echo "MICROVM: BOOTED"; else echo "MICROVM: NOT RUNNING"; fi
+          echo "--- firecracker log tail ---"
+          tail -5 fc.log
+          pkill -f firecracker
+          echo "firecracker stopped (guest destroyed)"
+          } 2>&1 | tee PROBE-RESULTS.md
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "probe-bot"
+          git config user.email "probe@localhost"
+          git add PROBE-RESULTS.md || true
+          git commit -m "probe results [skip ci]" || echo "nothing to commit"
+          git push || true
